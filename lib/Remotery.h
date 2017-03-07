@@ -77,6 +77,10 @@ documented just below this comment.
 #define RMT_USE_POSIX_THREADNAMES 0
 #endif
 
+// Allow use of virtual mirror buffer
+#ifndef RMT_USE_VIRTUAL_MIRROR_BUFFER
+#define RMT_USE_VIRTUAL_MIRROR_BUFFER 1
+#endif
 
 /*
 ------------------------------------------------------------------------------------------------------------------------

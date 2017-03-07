@@ -679,6 +679,8 @@ static rmtError VirtualMirrorBuffer_Constructor(VirtualMirrorBuffer* buffer, rmt
     buffer->file_map_handle = INVALID_HANDLE_VALUE;
 #endif
 
+#if RMT_USE_VIRTUAL_MIRROR_BUFFER
+
 #ifdef RMT_PLATFORM_WINDOWS
 
     // Windows version based on https://gist.github.com/rygorous/3158316
@@ -849,6 +851,11 @@ static rmtError VirtualMirrorBuffer_Constructor(VirtualMirrorBuffer* buffer, rmt
 
 #endif
 
+#else
+    // Cannot map physical memory multiple times, just allocate a single buffer
+    buffer->ptr = rmtMalloc(size);
+#endif
+
     // Cleanup if exceeded number of attempts or failed
     if (buffer->ptr == NULL)
         return RMT_ERROR_VIRTUAL_MEMORY_BUFFER_FAIL;
@@ -860,6 +867,8 @@ static rmtError VirtualMirrorBuffer_Constructor(VirtualMirrorBuffer* buffer, rmt
 static void VirtualMirrorBuffer_Destructor(VirtualMirrorBuffer* buffer)
 {
     assert(buffer != 0);
+
+#if RMT_USE_VIRTUAL_MIRROR_BUFFER
 
 #ifdef RMT_PLATFORM_WINDOWS
     if (buffer->file_map_handle != NULL)
@@ -877,6 +886,10 @@ static void VirtualMirrorBuffer_Destructor(VirtualMirrorBuffer* buffer)
 #ifdef RMT_PLATFORM_LINUX
     if (buffer->ptr != NULL)
         munmap(buffer->ptr, buffer->size * 2);
+#endif
+
+#else
+    rmtFree(buffer->ptr);
 #endif
 
     buffer->ptr = NULL;
@@ -3301,6 +3314,7 @@ static rmtError WebSocket_Receive(WebSocket* web_socket, void* data, rmtU32* msg
 typedef enum MessageID
 {
     MsgID_NotReady,
+    MsgID_SkipForWrap,
     MsgID_LogText,
     MsgID_SampleTree,
 } MessageID;
@@ -3376,7 +3390,11 @@ static rmtU32 rmtMessageQueue_SizeForPayload(rmtU32 payload_size)
 {
     // Add message header and align for ARM platforms
     rmtU32 size = sizeof(Message) + payload_size;
+#if RMT_USE_VIRTUAL_MIRROR_BUFFER
     size = (size + 3) & ~3U;
+#else
+    size = (size + 31) & ~31U;
+#endif
     return size;
 }
 
@@ -3395,15 +3413,34 @@ static Message* rmtMessageQueue_AllocMessage(rmtMessageQueue* queue, rmtU32 payl
         rmtU32 s = queue->size;
         rmtU32 r = queue->read_pos;
         rmtU32 w = queue->write_pos;
-        if ((int)(w - r) > ((int)(s - write_size)))
+
+#if RMT_USE_VIRTUAL_MIRROR_BUFFER
+        rmtU32 a = 0;
+#else
+        rmtU32 wp = w & (s - 1);
+        rmtU32 a = (wp + write_size > s) ? (s - wp) : 0;
+        assert(a == 0 || a >= sizeof(Message));
+#endif
+
+        if ((int)(w - r) > ((int)(s - write_size - a)))
             return NULL;
 
         // Point to the newly allocated space
-        msg = (Message*)(queue->data->ptr + (w & (s - 1)));
+        msg = (Message*)(queue->data->ptr + ((w + a) & (s - 1)));
 
         // Increment the write position, leaving the loop if this is the thread that succeeded
-        if (AtomicCompareAndSwap(&queue->write_pos, w, w + write_size) == RMT_TRUE)
+        if (AtomicCompareAndSwap(&queue->write_pos, w, w + write_size + a) == RMT_TRUE)
         {
+            // Write waste
+            if (a != 0)
+            {
+                Message *waste = (Message *)(queue->data->ptr + (w & (s - 1)));
+                waste->payload_size = a - sizeof(Message);
+                waste->thread_sampler = thread_sampler;
+                WriteFence();
+                waste->id = MsgID_SkipForWrap;
+            }
+
             // Safe to set payload size after thread claims ownership of this allocated range
             msg->payload_size = payload_size;
             msg->thread_sampler = thread_sampler;
@@ -4488,6 +4525,8 @@ static rmtError Remotery_ConsumeMessageQueue(Remotery* rmt)
                 break;
 
             // Dispatch to message handler
+            case MsgID_SkipForWrap:
+                break;
             case MsgID_LogText:
                 error = Remotery_SendLogTextMessage(rmt, message);
                 break;
@@ -4523,6 +4562,7 @@ static void Remotery_FlushMessageQueue(Remotery* rmt)
         {
             // These can be safely ignored
             case MsgID_NotReady:
+            case MsgID_SkipForWrap:
             case MsgID_LogText:
                 break;
 
